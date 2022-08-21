@@ -1,13 +1,12 @@
 from logging import getLogger, Logger
 from dataclasses import dataclass
 from dataclasses_json import dataclass_json
-from typing import List, Any, Optional
+from typing import Dict, List, Optional
 from httpx import AsyncClient
 from asyncio import Semaphore
 import logging
 import lxml.html
 import httpx
-import feedparser
 import asyncio
 import random
 import re
@@ -15,55 +14,12 @@ import re
 logging.basicConfig(level=logging.DEBUG)
 
 
-@dataclass
-class FeedEntryAuthorResponse():
-    name: str
-
-
-@dataclass
-class FeedEntryTagResponse():
-    term: str
-    scheme: str
-    label: None
-
-
-@dataclass_json
-@dataclass
-class FeedEntryResponse():
-    authors: List[FeedEntryAuthorResponse]
-    author_detail: FeedEntryAuthorResponse
-    author: str
-    title: str
-    title_detail: dict
-    links: List[dict]
-    link: str
-    id: str
-    guidislink: bool
-    updated: str
-    updated_parsed: List[int]
-    published: str
-    published_parsed: List[int]
-    tags: List[FeedEntryTagResponse]
-    summary: str
-    summary_detail: dict
-    content: List[dict]
-    thr_total: str
-
-
 @dataclass_json
 @dataclass
 class FeedResponse():
-    bozo: bool
-    entries: List[FeedEntryResponse]
-    feed: dict
-    headers: dict
-    href: str
-    status: int
-    version: str
-    encoding: str
-    namespaces: dict
-    updated: Optional[str] = None
-    updated_parsed: Optional[List[int]] = None
+    urls: List[str]
+    current_page: int
+    total_pages: int = -1
 
 
 @dataclass_json
@@ -73,23 +29,38 @@ class SS():
     sentences: List[str]
 
 
-class GochiusaSSS():
+class MorikinokoSSS():
     logger: Logger
     endpoint: str
 
     def __init__(
         self,
-        endpoint: str = "https://gochiusa-ss.com/category/gochiusa/feed/atom/"
+        endpoint: str = "http://morikinoko.com/archives/cat_50053820.html"
     ) -> None:
         self.logger = getLogger(__name__)
         self.endpoint = endpoint
 
-    def get_feeds(self, page: int) -> FeedResponse:
+    async def get_feeds(self, page: int) -> FeedResponse:
         self.logger.debug(f"Getting feeds {page}")
-        ret: Any = feedparser.parse(self.endpoint + f"?paged={page}")
-        feeds = FeedResponse(**ret)
+        async with httpx.AsyncClient() as client:
+            params: Optional[Dict] = None
+            if page != 1:
+                params = {"p": page}
+            resp = await client.get(
+                self.endpoint,
+                params=params
+            )
+        html = lxml.html.fromstring(resp.text)  # type: ignore
+        total_pages_objects: List[str] = html.xpath(
+            '//li[@class="paging-last"]/a/@href')  # type: ignore
+        total_pages = -1
+        if len(total_pages_objects) > 0:
+            total_pages = int(total_pages_objects[0].split("?p=")[1])
+        urls: List[str] = html.xpath(
+            '//h1[@class="card-title mr-2 article-list-title"]/a/@href')  # type: ignore
+        feed = FeedResponse(urls, page, total_pages)
         self.logger.debug(f"Getting feeds {page} success")
-        return feeds
+        return feed
 
     async def parse_page(
         self, semaphore: Semaphore, client: AsyncClient, url: str
@@ -99,38 +70,43 @@ class GochiusaSSS():
             self.logger.debug(f"Getting {url}")
             resp = await client.get(url)
             html = lxml.html.fromstring(resp.text)
-            title = html.xpath('//h1[@class="entry-title"]/text()')[0]
+            title: str = html.xpath(
+                '//h1[@class="card-title article-title mt-4"]/a/text()'
+            )[0].strip()
             title = re.sub(r'[\\|/|:|?|.|"|<|>|\|]', '-', title)
-            body: List[str] = html.xpath(
-                '//div[@class="entry-content cf"]/p/text()')
-            body = [b for b in body if b != "\xa0"]
+            sentences_objects: List[str] = html.xpath(
+                '//div[@class="mtex mtex-link"]/text()'
+            )
+            sentences = [obj for obj in sentences_objects if obj != "\n"]
             self.logger.debug(f"Getting {url} success")
-            return SS(title, body)
+            return SS(title, sentences)
 
     async def run(self) -> List[SS]:
         page = 1
         sem = asyncio.Semaphore(5)
-        feeds = self.get_feeds(page)
+        feeds = await self.get_feeds(page)
         ret: List[SS] = []
-        while feeds.status != 404:
+        while feeds.total_pages != -1:
             self.logger.debug(f"Processing page {page}")
             async with httpx.AsyncClient() as client:
                 tasks = [
-                    self.parse_page(sem, client, e.link)
-                    for e in feeds.entries
+                    self.parse_page(sem, client, url)
+                    for url in feeds.urls
                 ]
                 resp = await asyncio.gather(*tasks, return_exceptions=False)
                 ret.extend(resp)
                 page += 1
-                feeds = self.get_feeds(page)
+                feeds = await self.get_feeds(page)
             self.logger.debug(f"Page {page} done")
             await asyncio.sleep(random.randint(3, 8))
         return ret
 
 
-async def main() -> None:
-    cl = GochiusaSSS()
+async def main(dryRun: bool = True) -> None:
+    cl = MorikinokoSSS()
     ss_objects = await cl.run()
+    if dryRun:
+        return
     for ss in ss_objects:
         cl.logger.debug(f"Writing {ss.title}.txt")
         with open(f"out/{ss.title}.txt", "w", encoding="utf-8") as f:
@@ -140,4 +116,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    loop.run_until_complete(main(dryRun=False))

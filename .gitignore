@@ -129,3 +129,4 @@ dmypy.json
 .pyre/
 
 src/out/*.txt
+src/out/out.tsv
